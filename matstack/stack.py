@@ -27,11 +27,37 @@ Shared conventions
   is expected to round its results.
 """
 
+import copy
+import math
+
 TOLERANCE = 1e-6
 
 
 class StackError(ValueError):
     """Raised when a layer stack, a layer or a normal cannot be used."""
+
+
+def _clamp01(value):
+    """Clamp a scalar channel into the closed range ``0.0..1.0``."""
+    return max(0.0, min(1.0, value))
+
+
+def _in_range(value):
+    """True when ``value`` is a real number inside ``0.0..1.0`` (inclusive)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) \
+        and 0.0 <= float(value) <= 1.0
+
+
+def _normalize_vector(vector):
+    """Return ``vector`` scaled to unit length.
+
+    A zero-length vector cannot define a direction and raises
+    :class:`StackError`.
+    """
+    length = math.sqrt(sum(component * component for component in vector))
+    if length == 0.0:
+        raise StackError("zero-length normal cannot be normalized")
+    return tuple(component / length for component in vector)
 
 
 def normalize_layers(layers):
@@ -53,7 +79,11 @@ def normalize_layers(layers):
     bottom layer must be the one with the smallest ``order`` whatever its
     position in the input list.
     """
-    raise NotImplementedError
+    ordered = [layer for layer in layers if "order" in layer]
+    unordered = [layer for layer in layers if "order" not in layer]
+    # Python's sort is stable, so equal orders keep their relative input order.
+    ordered.sort(key=lambda layer: layer["order"])
+    return ordered + unordered
 
 
 def blend_over(base, layer):
@@ -81,7 +111,21 @@ def blend_over(base, layer):
 
     Channels are clamped to ``0.0..1.0``.
     """
-    raise NotImplementedError
+    alpha = layer.get("opacity", 1.0) * layer.get("mask", 1.0)
+    layer_color = layer["color"]
+
+    if base is None:
+        return tuple(
+            _clamp01(channel * alpha) for channel in layer_color
+        )
+
+    return tuple(
+        _clamp01(
+            layer_color[index] * alpha
+            + base[index] * (1.0 - alpha)
+        )
+        for index in range(3)
+    )
 
 
 def blend_normal_map(base_n, layer_n, mask):
@@ -109,7 +153,36 @@ def blend_normal_map(base_n, layer_n, mask):
     normalization. A zero-length input normal, or a mask outside
     ``0.0..1.0``, raises :class:`StackError`.
     """
-    raise NotImplementedError
+    if not _in_range(mask):
+        raise StackError(f"mask {mask!r} is outside the range 0.0..1.0")
+
+    base = _normalize_vector(base_n)
+    layer = _normalize_vector(layer_n)
+
+    t = (base[0], base[1], base[2] + 1.0)
+    u = (-layer[0], -layer[1], layer[2])
+    dot_tu = t[0] * u[0] + t[1] * u[1] + t[2] * u[2]
+
+    reoriented = (
+        t[0] * dot_tu - u[0] * t[2],
+        t[1] * dot_tu - u[1] * t[2],
+        t[2] * dot_tu - u[2] * t[2],
+    )
+    reoriented_length = math.sqrt(
+        sum(component * component for component in reoriented)
+    )
+    if reoriented_length == 0.0:
+        # Degenerate geometry (e.g. a base normal pointing straight down):
+        # there is no tangent frame to reorient into, keep the base direction.
+        rnm = base
+    else:
+        rnm = tuple(component / reoriented_length for component in reoriented)
+
+    blended = tuple(
+        base[index] * (1.0 - mask) + rnm[index] * mask
+        for index in range(3)
+    )
+    return _normalize_vector(blended)
 
 
 def apply_mask(color, mask, invert):
@@ -128,7 +201,35 @@ def apply_mask(color, mask, invert):
     the inverted result must differ. A ``mask`` outside ``0.0..1.0`` raises
     :class:`StackError`.
     """
-    raise NotImplementedError
+    if not _in_range(mask):
+        raise StackError(f"mask {mask!r} is outside the range 0.0..1.0")
+
+    coverage = 1.0 - mask if invert else mask
+    return tuple(_clamp01(channel * coverage) for channel in color)
+
+
+def _composite(layers, validate):
+    """Internal compositing entry point used by :func:`resolve` and batches."""
+    if not layers:
+        raise StackError("empty stack: a stack with no layers has no result")
+
+    if validate:
+        problems = validate_stack(layers)
+        if problems:
+            raise StackError("; ".join(problems))
+
+    ordered = normalize_layers(layers)
+
+    color = None                     # transparent black
+    normal = (0.0, 0.0, 1.0)         # flat
+    for layer in ordered:
+        # The effective alpha is computed once and feeds both the color and
+        # the normal blend weight, so mask and opacity each take effect once.
+        eff = layer.get("opacity", 1.0) * layer.get("mask", 1.0)
+        color = blend_over(color, layer)
+        normal = blend_normal_map(normal, layer["normal"], eff)
+
+    return {"color": tuple(color), "normal": tuple(normal)}
 
 
 def resolve(layers):
@@ -162,7 +263,7 @@ def resolve(layers):
     The returned color channels are clamped to ``0.0..1.0`` and the returned
     normal is a unit vector.
     """
-    raise NotImplementedError
+    return _composite(layers, validate=True)
 
 
 def merge_layers(a, b):
@@ -187,7 +288,30 @@ def merge_layers(a, b):
     ``(0.0, 0.0, 1.0)``. The two input dicts are not modified. A zero-length
     normal in either input raises :class:`StackError`.
     """
-    raise NotImplementedError
+    a_mask = a.get("mask", 1.0)
+    b_mask = b.get("mask", 1.0)
+    a_opacity = a.get("opacity", 1.0)
+    b_opacity = b.get("opacity", 1.0)
+    a_normal = a.get("normal", (0.0, 0.0, 1.0))
+    b_normal = b.get("normal", (0.0, 0.0, 1.0))
+
+    merged_mask = a_mask * b_mask
+
+    merged = {
+        "id": a["id"] + "+" + b["id"],
+        "color": blend_over(a["color"], b),
+        "mask": merged_mask,
+        "opacity": a_opacity * b_opacity,
+        "normal": blend_normal_map(a_normal, b_normal, merged_mask),
+    }
+
+    orders = [
+        layer["order"] for layer in (a, b) if "order" in layer
+    ]
+    if orders:
+        merged["order"] = min(orders)
+
+    return merged
 
 
 def validate_stack(layers):
@@ -206,7 +330,36 @@ def validate_stack(layers):
     the layers. An out-of-range ``opacity`` must be reported instead of being
     silently composited, which would push color channels above ``1.0``.
     """
-    raise NotImplementedError
+    problems = []
+
+    if not layers:
+        problems.append("empty stack: no layers to composite")
+        return problems
+
+    seen_ids = set()
+    for layer in layers:
+        layer_id = layer.get("id", "<missing id>")
+        if layer_id in seen_ids:
+            problems.append(f"duplicate id: {layer_id}")
+        seen_ids.add(layer_id)
+
+    for layer in layers:
+        layer_id = layer.get("id", "<missing id>")
+
+        if not _in_range(layer.get("opacity", 1.0)):
+            problems.append(f"opacity out of range: {layer_id}")
+
+        if not _in_range(layer.get("mask", 1.0)):
+            problems.append(f"mask out of range: {layer_id}")
+
+        normal = layer.get("normal", (0.0, 0.0, 1.0))
+        normal_length = math.sqrt(
+            sum(component * component for component in normal)
+        )
+        if normal_length == 0.0:
+            problems.append(f"zero normal: {layer_id}")
+
+    return problems
 
 
 def stack_batch(materials, config):
@@ -238,4 +391,50 @@ def stack_batch(materials, config):
     ``opacity``, ``normal``, optional ``order``); mutable state is copied,
     never aliased.
     """
-    raise NotImplementedError
+    strict = config.get("strict", True)
+    do_validate = config.get("validate", True)
+
+    results = []
+    errors = []
+
+    for material in materials:
+        material_id = material.get("id", "<missing id>")
+        problems = []
+        try:
+            # A deep copy per material guarantees that neither the layer list
+            # nor any layer dict is shared across materials or with the caller.
+            layers_copy = copy.deepcopy(material["layers"])
+
+            if do_validate:
+                problems = validate_stack(layers_copy)
+                if problems:
+                    raise StackError("; ".join(problems))
+
+            composite = _composite(layers_copy, validate=False)
+        except StackError as error:
+            if strict:
+                raise StackError(
+                    f"material {material_id!r} failed: {error}"
+                ) from error
+            errors.append(
+                {"id": material_id, "problems": problems or [str(error)]}
+            )
+            continue
+        except (KeyError, TypeError) as error:
+            # Missing required keys / malformed structures are data errors too.
+            if strict:
+                raise StackError(
+                    f"material {material_id!r} failed: {error}"
+                ) from error
+            errors.append({"id": material_id, "problems": [str(error)]})
+            continue
+
+        results.append(
+            {
+                "id": material_id,
+                "color": composite["color"],
+                "normal": composite["normal"],
+            }
+        )
+
+    return {"results": results, "errors": errors}
